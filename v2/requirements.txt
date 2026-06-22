@@ -1,0 +1,49 @@
+# Core runtime (required)
+streamlit>=1.30
+openai>=1.0
+
+# YAML frontmatter (recommended). The app falls back to a tiny built-in parser if
+# this is missing, but PyYAML handles edge cases more robustly.
+PyYAML>=6.0
+
+# ---------------------------------------------------------------------------
+# OPTIONAL ADD-ONS — you do NOT need to edit this file to install these.
+# The app has a built-in installer: open the sidebar "依賴套件 (Dependencies)"
+# panel and click Install. It pip-installs into the running venv and the feature
+# lights up after the page reloads. The lines below are kept for manual installs.
+#
+# The "關係圖譜 (Knowledge Graph)" tab needs NO extra packages — it renders with
+# vis-network from a CDN, so it works on any Python (incl. 3.14).
+# ---------------------------------------------------------------------------
+
+# Optional: Anthropic Claude provider. Only needed if you select "Anthropic Claude".
+# anthropic>=0.34
+
+# Optional: local BERT-based Chinese NER for "Extract & Create Entity Pages".
+# Without these, entity extraction automatically falls back to the configured LLM
+# (or a built-in dynasty/era gazetteer when no API is available).
+# transformers>=4.30
+# torch>=2.0
+
+# Optional: OCR — extract Chinese text from uploaded images / PDFs.
+# The OCR panel always offers the "Vision LLM" engine (it only needs the chat
+# client above). The two OFFLINE engines and PDF support are enabled only when
+# their packages are installed:
+#   - PDF support (rasterizes each page so it can be OCR'd) — installs on all
+#     Python versions including 3.14:
+# pymupdf>=1.24
+#   - Tesseract (offline; ALSO needs the Tesseract binary + chi_sim/chi_tra data):
+# pytesseract>=0.3.10
+#   - Image decoding (required by the PaddleOCR/Tesseract engines):
+# Pillow>=10.0
+#   - PaddleOCR (best for Chinese, fully offline):
+# paddleocr>=2.7
+# paddlepaddle>=2.6
+#
+# IMPORTANT (Python version): as of mid-2026, `paddlepaddle` publishes NO wheel
+# for Python 3.13/3.14, so PaddleOCR cannot be installed there (the in-app
+# installer will say so). torch/transformers DO have 3.14 wheels. If you need
+# PaddleOCR, use Python 3.10–3.12; otherwise use Tesseract or the Vision LLM
+# engine, which work everywhere.
+
+

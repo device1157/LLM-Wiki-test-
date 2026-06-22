@@ -1,0 +1,12 @@
+# Dark theme to match the knowledge-graph look (relationship.png).
+# Delete this file or set base = "light" to revert to the default light theme.
+[theme]
+base = "dark"
+primaryColor = "#4F9DFF"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1C1F26"
+textColor = "#E8EAED"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
