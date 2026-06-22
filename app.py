@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
@@ -18,10 +21,40 @@ try:
 except ImportError:  # Claude support is optional unless that provider is selected.
     Anthropic = None
 
+try:
+    import fitz  # PyMuPDF
+except ImportError:  # PDF support is optional until the Document OCR tab is used.
+    fitz = None
+
+try:
+    import pytesseract
+except ImportError:  # OCR support is optional for PDFs that already contain text.
+    pytesseract = None
+
+try:
+    import numpy as np
+except ImportError:  # RapidOCR uses numpy arrays; keep startup graceful if unavailable.
+    np = None
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except ImportError:  # Pure-Python OCR fallback when the Tesseract program is unavailable.
+    RapidOCR = None
+
+try:
+    from PIL import Image
+except ImportError:  # Pillow is required by pytesseract, but keep startup graceful.
+    Image = None
+
 
 DATA_DIR = Path("wiki_data")
 KEYS_DIR = Path("keys")
 PROMPT_DIR = Path("prmopt")
+SOURCE_DOCS_DIR = Path("source_docs")
+DEFAULT_OCR_LANGUAGE = "chi_sim+chi_tra+eng"
+DEFAULT_OCR_DPI = 200
+OCR_TEXT_MIN_CHARS = 80
+PDF_ANALYSIS_MAX_CHARS = 24000
 DEFAULT_PROMPT_NAME = "default_wiki_maintainer"
 DEFAULT_WIKI_PROMPT = """You are an autonomous Markdown wiki maintainer.
 
@@ -61,7 +94,7 @@ PROVIDER_LOCAL = "Local OpenAI-compatible"
 PROVIDER_OPENAI = "OpenAI GPT"
 PROVIDER_GEMINI = "Google Gemini"
 PROVIDER_CLAUDE = "Anthropic Claude"
-PROVIDER_NEWAPI = "JuAI / NewAPI"
+PROVIDER_NEWAPI = "third party provider"
 PROVIDER_CUSTOM = "Custom OpenAI-compatible"
 BACKEND_OPENAI_COMPATIBLE = "openai_compatible"
 BACKEND_ANTHROPIC = "anthropic"
@@ -140,6 +173,10 @@ def ensure_prompt_dir() -> None:
     PROMPT_DIR.mkdir(exist_ok=True)
 
 
+def ensure_source_docs_dir() -> None:
+    SOURCE_DOCS_DIR.mkdir(exist_ok=True)
+
+
 def prompt_path(name: str) -> Path:
     safe_name = key_file_stem(name) or DEFAULT_PROMPT_NAME
     return PROMPT_DIR / f"{safe_name}.md"
@@ -174,6 +211,16 @@ def scan_pages() -> list[str]:
 def scan_prompts() -> list[str]:
     ensure_default_prompt()
     return sorted(path.stem for path in PROMPT_DIR.glob("*.md"))
+
+
+def scan_pdf_documents() -> list[Path]:
+    ensure_prompt_dir()
+    ensure_source_docs_dir()
+    candidates: dict[str, Path] = {}
+    for directory in (SOURCE_DOCS_DIR, PROMPT_DIR):
+        for path in directory.glob("*.pdf"):
+            candidates[str(path.resolve()).lower()] = path
+    return sorted(candidates.values(), key=lambda path: path.name.casefold())
 
 
 def read_prompt(name: str) -> str:
@@ -743,6 +790,485 @@ def parse_topic_suggestions(raw_text: str) -> list[str]:
     return topics
 
 
+def find_tesseract_executable() -> str:
+    candidates = [
+        shutil.which("tesseract") or "",
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        str(Path(os.getenv("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return ""
+
+
+@st.cache_resource(show_spinner=False)
+def get_rapidocr_engine():
+    if RapidOCR is None:
+        return None
+    return RapidOCR()
+
+
+def rapidocr_available() -> bool:
+    return RapidOCR is not None and np is not None
+
+
+def pdf_support_status() -> dict[str, object]:
+    tesseract_path = find_tesseract_executable()
+    languages: list[str] = []
+    if pytesseract is not None and tesseract_path:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            languages = sorted(pytesseract.get_languages(config=""))
+        except Exception:
+            languages = []
+    chinese_language_available = any(language in languages for language in ("chi_sim", "chi_tra"))
+    return {
+        "pymupdf": fitz is not None,
+        "pytesseract": pytesseract is not None,
+        "rapidocr": rapidocr_available(),
+        "pillow": Image is not None,
+        "tesseract_path": tesseract_path or "",
+        "languages": languages,
+        "chinese_language_available": chinese_language_available,
+    }
+
+
+def get_pdf_page_count(path: Path) -> int:
+    if fitz is None:
+        return 0
+    try:
+        with fitz.open(path) as document:
+            return document.page_count
+    except Exception:
+        return 0
+
+
+def clamp_page_range(start_page: int, end_page: int, page_count: int) -> tuple[int, int]:
+    if page_count <= 0:
+        return 1, 1
+    start = max(1, min(start_page, page_count))
+    end = max(start, min(end_page, page_count))
+    return start, end
+
+
+def render_pdf_page_image(page, dpi: int):
+    scale = max(72, dpi) / 72
+    matrix = fitz.Matrix(scale, scale)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+    image_bytes = pixmap.tobytes("png")
+    with Image.open(BytesIO(image_bytes)) as image:
+        return image.convert("RGB")
+
+
+def ocr_with_tesseract(image, language: str, tesseract_path: str) -> str:
+    if pytesseract is None:
+        raise RuntimeError("The `pytesseract` Python package is not installed.")
+    if not tesseract_path:
+        raise RuntimeError("The Tesseract program is not installed or is not on PATH.")
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    try:
+        return pytesseract.image_to_string(image, lang=language).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            "Tesseract OCR failed. Confirm that Chinese language data "
+            f"for `{language}` is available. Details: {exc}"
+        ) from exc
+
+
+def ocr_with_rapidocr(image) -> str:
+    if not rapidocr_available():
+        raise RuntimeError(
+            "RapidOCR is not installed. Install it with `python -m pip install rapidocr_onnxruntime`."
+        )
+    engine = get_rapidocr_engine()
+    if engine is None:
+        raise RuntimeError("RapidOCR could not be initialized.")
+    image_array = np.array(image.convert("RGB"))
+    result, _elapsed = engine(image_array)
+    lines: list[str] = []
+    for item in result or []:
+        if len(item) >= 2 and isinstance(item[1], str):
+            text = item[1].strip()
+            if text:
+                lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def ocr_page_image(image, language: str, engine: str) -> tuple[str, str]:
+    selected_engine = engine
+    status = pdf_support_status()
+    if selected_engine == "auto":
+        selected_engine = "tesseract" if status.get("tesseract_path") else "rapidocr"
+
+    if selected_engine == "tesseract":
+        return (
+            ocr_with_tesseract(image, language, str(status.get("tesseract_path") or "")),
+            "ocr-tesseract",
+        )
+    if selected_engine == "rapidocr":
+        return ocr_with_rapidocr(image), "ocr-rapidocr"
+
+    raise RuntimeError(f"Unknown OCR engine: {engine}")
+
+
+def extract_pdf_text(
+    path: Path,
+    *,
+    start_page: int,
+    end_page: int,
+    use_ocr: bool,
+    ocr_language: str,
+    ocr_engine: str,
+    dpi: int,
+    progress_callback=None,
+) -> tuple[str, list[dict[str, object]]]:
+    if fitz is None:
+        raise RuntimeError("Install `PyMuPDF` to read PDF files: `python -m pip install PyMuPDF`.")
+    if use_ocr and Image is None:
+        raise RuntimeError("Install `Pillow` before using OCR: `python -m pip install Pillow`.")
+
+    page_results: list[dict[str, object]] = []
+    with fitz.open(path) as document:
+        start, end = clamp_page_range(start_page, end_page, document.page_count)
+        selected_pages = list(range(start - 1, end))
+        total_pages = len(selected_pages)
+        for index, page_index in enumerate(selected_pages, start=1):
+            page = document.load_page(page_index)
+            extracted = (page.get_text("text") or "").strip()
+            method = "text-layer"
+            page_text = extracted
+            if use_ocr and len(re.sub(r"\s+", "", extracted)) < OCR_TEXT_MIN_CHARS:
+                image = render_pdf_page_image(page, dpi)
+                page_text, method = ocr_page_image(image, ocr_language, ocr_engine)
+
+            page_number = page_index + 1
+            page_results.append(
+                {
+                    "page": page_number,
+                    "method": method,
+                    "chars": len(page_text),
+                    "text": page_text,
+                }
+            )
+            if progress_callback is not None:
+                progress_callback(index, total_pages, page_number, method)
+
+    chunks = []
+    for result in page_results:
+        chunks.append(f"## Page {result['page']} ({result['method']})\n\n{result['text']}".strip())
+    return "\n\n---\n\n".join(chunks).strip(), page_results
+
+
+def truncate_for_llm(text: str, max_chars: int = PDF_ANALYSIS_MAX_CHARS) -> tuple[str, bool]:
+    cleaned = text.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned, False
+    return cleaned[:max_chars].rstrip(), True
+
+
+def build_document_source_note(
+    *,
+    pdf_path: Path,
+    start_page: int,
+    end_page: int,
+    page_results: list[dict[str, object]],
+    ocr_language: str,
+    ocr_engine: str,
+    used_ocr: bool,
+) -> str:
+    method_counts: dict[str, int] = {}
+    for result in page_results:
+        method = str(result.get("method") or "unknown")
+        method_counts[method] = method_counts.get(method, 0) + 1
+    method_summary = ", ".join(f"{method}: {count}" for method, count in sorted(method_counts.items()))
+    total_chars = sum(int(result.get("chars") or 0) for result in page_results)
+    return (
+        f"Source PDF: `{pdf_path.name}`\n"
+        f"Pages analyzed: {start_page}-{end_page}\n"
+        f"Extraction methods: {method_summary or 'none'}\n"
+        f"OCR engine: `{ocr_engine}`\n"
+        f"OCR language: `{ocr_language}`\n"
+        f"OCR fallback enabled: {'yes' if used_ocr else 'no'}\n"
+        f"Extracted characters: {total_chars}\n"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+
+
+def analyze_document_text(
+    *,
+    pdf_path: Path,
+    extracted_text: str,
+    page_range: tuple[int, int],
+    analysis_prompt: str,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str, bool]:
+    text_for_llm, was_truncated = truncate_for_llm(extracted_text)
+    system_prompt = build_system_prompt(
+        "You are a careful Chinese historical-literature research assistant. Return raw Markdown only. "
+        "Use the supplied OCR/PDF text as evidence, preserve Chinese titles and names, and mark uncertainty clearly."
+    )
+    user_prompt = (
+        f"Analyze the Chinese historical/literary PDF `{pdf_path.name}` for wiki notes.\n"
+        f"Page range: {page_range[0]}-{page_range[1]}.\n"
+        f"Text was truncated before analysis: {'yes' if was_truncated else 'no'}.\n\n"
+        "User analysis request:\n"
+        f"{analysis_prompt.strip()}\n\n"
+        "Extracted PDF/OCR text:\n"
+        f"{text_for_llm}"
+    )
+    analysis = complete_chat(
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    ).strip()
+    return analysis, was_truncated
+
+
+def save_uploaded_pdf(uploaded_file) -> Path:
+    ensure_source_docs_dir()
+    safe_name = sanitize_title(Path(uploaded_file.name).stem)
+    target = SOURCE_DOCS_DIR / f"{safe_name}.pdf"
+    target.write_bytes(uploaded_file.getbuffer())
+    return target
+
+
+def format_pdf_option(path: Path) -> str:
+    page_count = get_pdf_page_count(path)
+    location = path.parent.name
+    page_suffix = f", {page_count} pages" if page_count else ""
+    return f"{path.name} ({location}{page_suffix})"
+
+
+def render_pdf_status(status: dict[str, object]) -> None:
+    with st.expander("OCR Setup Status", expanded=False):
+        if status["pymupdf"]:
+            st.success("PDF text extraction is available through PyMuPDF.")
+        else:
+            st.error("PyMuPDF is missing. Install it with `python -m pip install PyMuPDF`.")
+
+        if status["pytesseract"] and status["pillow"]:
+            st.success("Tesseract Python OCR package is installed.")
+        else:
+            st.warning("Install OCR Python packages with `python -m pip install pytesseract Pillow`.")
+
+        if status.get("rapidocr"):
+            st.success("RapidOCR fallback is available. This can OCR Chinese scanned pages without Tesseract.")
+        else:
+            st.warning("RapidOCR fallback is missing. Install it with `python -m pip install rapidocr_onnxruntime`.")
+
+        tesseract_path = str(status.get("tesseract_path") or "")
+        if tesseract_path:
+            st.success(f"Tesseract found at `{tesseract_path}`.")
+        else:
+            if status.get("rapidocr"):
+                st.info("Tesseract is not installed, so Auto OCR will use RapidOCR instead.")
+            else:
+                st.warning(
+                    "Tesseract OCR is not on PATH. Text-layer extraction still works, but scanned pages need "
+                    "Tesseract plus Chinese language data (`chi_sim` and/or `chi_tra`) or RapidOCR."
+                )
+
+        languages = status.get("languages") or []
+        if languages:
+            preview = ", ".join(str(language) for language in languages[:12])
+            st.caption(f"Available OCR languages include: {preview}")
+        if not status.get("chinese_language_available"):
+            st.info(
+                "For Chinese PDFs, install Tesseract language packs for Simplified Chinese (`chi_sim`) "
+                "and Traditional Chinese (`chi_tra`) if OCR fallback is needed."
+            )
+
+
+def render_document_ocr(llm_settings: dict[str, object]) -> None:
+    st.header("Document OCR")
+    st.caption(
+        "Extract Chinese PDF text into the wiki, with OCR fallback for scanned pages, then ask the selected LLM "
+        "to turn the text into historical/literary notes."
+    )
+
+    status = pdf_support_status()
+    render_pdf_status(status)
+
+    uploaded_files = st.file_uploader(
+        "Add PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help=f"Uploaded PDFs are saved in `{SOURCE_DOCS_DIR}/`. Existing PDFs in `{PROMPT_DIR}/` are also listed.",
+    )
+    if uploaded_files:
+        saved_paths = []
+        for uploaded_file in uploaded_files:
+            saved_paths.append(save_uploaded_pdf(uploaded_file))
+        st.success("Saved: " + ", ".join(path.name for path in saved_paths))
+
+    pdf_paths = scan_pdf_documents()
+    if not pdf_paths:
+        st.info(f"Put PDFs in `{SOURCE_DOCS_DIR}/` or `{PROMPT_DIR}/`, then return to this tab.")
+        return
+
+    if fitz is None:
+        st.error("PDF support is unavailable until PyMuPDF is installed.")
+        return
+
+    option_labels = [format_pdf_option(path) for path in pdf_paths]
+    selected_label = st.selectbox("PDF to analyze", option_labels)
+    pdf_path = pdf_paths[option_labels.index(selected_label)]
+    page_count = get_pdf_page_count(pdf_path)
+    if page_count <= 0:
+        st.error("This PDF could not be opened. Try another file.")
+        return
+
+    st.caption(f"Selected file: `{pdf_path}`")
+
+    col_start, col_end, col_dpi = st.columns(3)
+    start_page = int(
+        col_start.number_input("Start page", min_value=1, max_value=page_count, value=1, step=1)
+    )
+    default_end = min(page_count, start_page + 4)
+    end_page = int(
+        col_end.number_input("End page", min_value=start_page, max_value=page_count, value=default_end, step=1)
+    )
+    dpi = int(
+        col_dpi.number_input(
+            "OCR DPI",
+            min_value=100,
+            max_value=400,
+            value=DEFAULT_OCR_DPI,
+            step=25,
+            help="Higher DPI can improve OCR accuracy but is slower.",
+        )
+    )
+
+    use_ocr = st.checkbox(
+        "Use OCR fallback when embedded PDF text is sparse",
+        value=True,
+        help="If a page already has readable text, the app uses it. OCR is only used for weak/scanned pages.",
+    )
+    engine_options = ["auto", "rapidocr", "tesseract"]
+    ocr_engine = st.selectbox(
+        "OCR engine",
+        engine_options,
+        index=0,
+        help="Auto uses Tesseract when available; otherwise it uses RapidOCR, which works without a separate install.",
+    )
+    ocr_language = st.text_input(
+        "Tesseract OCR language",
+        value=DEFAULT_OCR_LANGUAGE,
+        help="Used only by Tesseract. RapidOCR uses its built-in Chinese/English OCR model.",
+    )
+    if use_ocr and ocr_engine == "tesseract" and not status.get("tesseract_path"):
+        st.warning("Tesseract engine selected, but Tesseract is not installed. Choose Auto or RapidOCR.")
+    if use_ocr and ocr_engine in ("auto", "rapidocr") and not status.get("tesseract_path") and status.get("rapidocr"):
+        st.info("Tesseract is not installed, so this run will use RapidOCR for scanned pages.")
+
+    analysis_prompt = st.text_area(
+        "Analysis prompt",
+        value=(
+            "Create concise Markdown wiki notes in English with Chinese terms preserved. "
+            "Identify the work, author/context when visible, important people/places, themes, historical value, "
+            "and possible related wiki pages. Mention uncertain OCR readings."
+        ),
+        height=120,
+    )
+
+    default_page_title = sanitize_title(f"{pdf_path.stem} p{start_page}-{end_page}")
+    target_title = st.text_input("Save as wiki page", value=default_page_title)
+
+    col_extract, col_save_raw, col_analyze = st.columns(3)
+    extract_clicked = col_extract.button("Extract Preview", use_container_width=True)
+    save_raw_clicked = col_save_raw.button("Save Raw Text", use_container_width=True)
+    analyze_clicked = col_analyze.button("Analyze and Save", type="primary", use_container_width=True)
+
+    if not (extract_clicked or save_raw_clicked or analyze_clicked):
+        st.info("Start with a small page range, preview the extraction, then save or analyze it.")
+        return
+
+    start_page, end_page = clamp_page_range(start_page, end_page, page_count)
+    progress = st.progress(0.0)
+    status_line = st.empty()
+
+    def update_progress(index: int, total: int, page_number: int, method: str) -> None:
+        progress.progress(index / total)
+        status_line.caption(f"Processed page {page_number} with {method} ({index}/{total}).")
+
+    try:
+        with st.spinner("Extracting PDF text..."):
+            extracted_text, page_results = extract_pdf_text(
+                pdf_path,
+                start_page=start_page,
+                end_page=end_page,
+                use_ocr=use_ocr,
+                ocr_language=ocr_language.strip() or DEFAULT_OCR_LANGUAGE,
+                ocr_engine=ocr_engine,
+                dpi=dpi,
+                progress_callback=update_progress,
+            )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    source_note = build_document_source_note(
+        pdf_path=pdf_path,
+        start_page=start_page,
+        end_page=end_page,
+        page_results=page_results,
+        ocr_language=ocr_language.strip() or DEFAULT_OCR_LANGUAGE,
+        ocr_engine=ocr_engine,
+        used_ocr=use_ocr,
+    )
+    safe_target_title = sanitize_title(target_title)
+    st.success("Extraction complete.")
+    st.text_area("Extracted text preview", value=extracted_text[:12000], height=360)
+
+    if save_raw_clicked:
+        content = f"# {safe_target_title}\n\n## Source\n\n{source_note}\n\n## Extracted Text\n\n{extracted_text}\n"
+        write_page(safe_target_title, content)
+        st.success(f"Saved raw extracted text to `wiki_data/{safe_target_title}.md`.")
+        return
+
+    if analyze_clicked:
+        try:
+            with st.spinner("Asking the selected LLM to analyze the extracted text..."):
+                analysis, was_truncated = analyze_document_text(
+                    pdf_path=pdf_path,
+                    extracted_text=extracted_text,
+                    page_range=(start_page, end_page),
+                    analysis_prompt=analysis_prompt,
+                    **llm_settings,
+                )
+        except Exception as exc:
+            st.error(format_llm_error(exc, str(llm_settings.get("provider") or ""), str(llm_settings.get("base_url") or "")))
+            return
+
+        truncation_note = (
+            "\n\n> Note: The extracted text was longer than the analysis limit, so only the first "
+            f"{PDF_ANALYSIS_MAX_CHARS} characters were sent to the LLM."
+            if was_truncated
+            else ""
+        )
+        content = (
+            f"# {safe_target_title}\n\n"
+            f"## Source\n\n{source_note}{truncation_note}\n\n"
+            f"## AI Analysis\n\n{analysis}\n\n"
+            f"## Extracted Text\n\n{extracted_text}\n"
+        )
+        write_page(safe_target_title, content)
+        st.markdown(autolink_markdown(content, scan_pages(), safe_target_title))
+        st.success(f"Saved analysis to `wiki_data/{safe_target_title}.md`.")
+
+
 def render_sidebar(pages: list[str], current_content: str) -> dict[str, object]:
     st.sidebar.title("Raw LLM Wiki")
 
@@ -1246,10 +1772,13 @@ def render_wiki_page(pages: list[str], llm_settings: dict[str, object]) -> None:
 
 def render_main_page(pages: list[str], llm_settings: dict[str, object]) -> None:
     st.title("Raw LLM Wiki")
-    wiki_tab, prompt_tab = st.tabs(["Wiki", "Prompt Setting"])
+    wiki_tab, document_tab, prompt_tab = st.tabs(["Wiki", "Document OCR", "Prompt Setting"])
 
     with wiki_tab:
         render_wiki_page(pages, llm_settings)
+
+    with document_tab:
+        render_document_ocr(llm_settings)
 
     with prompt_tab:
         render_prompt_settings()
@@ -1273,6 +1802,7 @@ def main() -> None:
     apply_styles()
     ensure_data_dir()
     ensure_default_prompt()
+    ensure_source_docs_dir()
     pages = scan_pages()
     init_state(pages)
     current_content = read_page(st.session_state.current_page) if st.session_state.current_page else ""

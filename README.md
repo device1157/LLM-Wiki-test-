@@ -13,6 +13,7 @@ Raw LLM Wiki is a small Streamlit app for maintaining a local Markdown wiki with
 - Import New API connection JSON with `_type`, `key`, and `url`.
 - Auto-load the saved API key when switching providers.
 - Manage reusable AI behavior prompts in `prmopt/`.
+- Import and analyze Chinese PDF source documents with text extraction and OCR fallback.
 - Generate drafts for empty pages.
 - Add AI summaries to existing pages.
 - Suggest related wiki topics and create or open them quickly.
@@ -24,6 +25,8 @@ Raw LLM Wiki is a small Streamlit app for maintaining a local Markdown wiki with
 - Streamlit
 - OpenAI Python SDK
 - Anthropic Python SDK, required only when using Claude
+- PyMuPDF, RapidOCR, pytesseract, and Pillow for PDF import/OCR support
+- Optional: Tesseract OCR with Chinese language data if you prefer Tesseract over RapidOCR
 - Optional: a local OpenAI-compatible LLM server, such as LM Studio or an Ollama OpenAI-compatible server
 
 ## Setup
@@ -38,8 +41,12 @@ python -m venv .venv
 Install dependencies:
 
 ```powershell
-python -m pip install streamlit openai anthropic
+python -m pip install streamlit openai anthropic PyMuPDF pytesseract Pillow rapidocr_onnxruntime
 ```
+
+For scanned Chinese PDFs, the app can use RapidOCR from Python without a separate OCR program. If you prefer Tesseract, install the Tesseract OCR program and Chinese language data (`chi_sim` and/or `chi_tra`). On Windows, the UB Mannheim installer is the easiest option: https://github.com/UB-Mannheim/tesseract/wiki
+
+After installing Tesseract, restart the terminal or app so `tesseract.exe` is available on `PATH`.
 
 Run the app:
 
@@ -49,6 +56,22 @@ streamlit run app.py
 
 Open the URL Streamlit prints in the terminal, usually `http://localhost:8501`.
 
+## One-Click Start
+
+On Windows, double-click `Start Raw LLM Wiki.bat`.
+
+The launcher will:
+
+- Open this project folder.
+- Create `.venv` if it does not exist.
+- Install `streamlit`, `openai`, and `anthropic` if they are missing.
+- Install PDF/OCR Python packages if they are missing.
+- Use RapidOCR automatically when the Tesseract OCR program is not on `PATH`.
+- Open `http://localhost:8501` in your browser.
+- Start the Streamlit app.
+
+Keep the launcher window open while using the app. Close the window to stop the app.
+
 ## Basic Workflow
 
 1. Use `Create New Page` in the sidebar to create a wiki page.
@@ -56,8 +79,29 @@ Open the URL Streamlit prints in the terminal, usually `http://localhost:8501`.
 3. Turn on `Edit Page` to write Markdown manually.
 4. For empty pages, use `Generate Draft` in the `AI Agent` panel.
 5. Use `Summarize This Page` or `Suggest Related Topics` on an existing page.
-6. Use `Delete Page` at the bottom of a page when you want to remove it.
-7. Use the `Prompt Setting` tab to edit how the AI maintains the wiki.
+6. Use the `Document OCR` tab to extract and analyze PDFs into wiki pages.
+7. Use `Delete Page` at the bottom of a page when you want to remove it.
+8. Use the `Prompt Setting` tab to edit how the AI maintains the wiki.
+
+## Document OCR
+
+The `Document OCR` tab helps analyze Chinese history and literature PDFs, including the sample books currently placed in `prmopt/`.
+
+Workflow:
+
+1. Choose a PDF from the list, or upload one. Uploaded PDFs are saved in `source_docs/`.
+2. Select a small page range first, especially for large books.
+3. Keep `Use OCR fallback` enabled. The app will use embedded PDF text when available and OCR only when a page has too little text.
+4. Use `Extract Preview` to inspect the result.
+5. Use `Save Raw Text` to save extracted text directly into `wiki_data/`, or `Analyze and Save` to ask the selected LLM to create structured wiki notes.
+
+OCR notes:
+
+- Embedded PDF text extraction only needs PyMuPDF.
+- Scanned page OCR can use RapidOCR without installing the external Tesseract program.
+- If you choose the Tesseract engine, Chinese OCR needs Tesseract language data such as `chi_sim` for Simplified Chinese and `chi_tra` for Traditional Chinese.
+- The default Tesseract OCR language is `chi_sim+chi_tra+eng`; RapidOCR uses its built-in Chinese/English model.
+- For long books, analyze chapter-sized page ranges and save multiple pages rather than sending the whole book to the LLM at once.
 
 ## Prompt Setting
 
@@ -217,9 +261,11 @@ If you see a missing credentials error from the OpenAI SDK, enter any non-empty 
 
 ```text
 .
++-- Start Raw LLM Wiki.bat  # Windows one-click launcher
 +-- app.py          # Streamlit app
 +-- keys/          # Provider key storage; JSON secrets are ignored by git
 +-- prmopt/        # Editable AI behavior prompts
++-- source_docs/   # Uploaded or manually added PDF source documents
 +-- wiki_data/     # Markdown wiki pages
 +-- .gitignore
 `-- README.md

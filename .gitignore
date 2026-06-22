@@ -1,3 +1,4 @@
 keys/*.json
 __pycache__/
 .venv/
+source_docs/*.pdf

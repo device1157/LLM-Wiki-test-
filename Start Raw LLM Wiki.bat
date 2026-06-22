@@ -48,16 +48,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import streamlit, openai, anthropic" >nul 2>nul
+python -c "import streamlit, openai, anthropic, fitz, pytesseract, PIL, rapidocr_onnxruntime" >nul 2>nul
 if errorlevel 1 (
     echo Installing required packages...
-    python -m pip install streamlit openai anthropic
+    python -m pip install streamlit openai anthropic PyMuPDF pytesseract Pillow rapidocr_onnxruntime
     if errorlevel 1 (
         echo.
         echo Package installation failed. Check your internet connection and try again.
         pause
         exit /b 1
     )
+)
+
+where tesseract >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo Note: Tesseract OCR was not found on PATH.
+    echo The app will use RapidOCR for scanned Chinese pages instead.
+    echo If you prefer Tesseract, install it with chi_sim/chi_tra language data.
 )
 
 echo.
